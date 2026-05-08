@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: apsg-report
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PORT
+        value: "10000"
+      - key: RENDER
+        value: "true"
+      - key: ADMIN_EMAIL
+        value: "karthickkv02@gmail.com"
+      - key: SMTP_HOST
+        value: "smtp.gmail.com"
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        value: "karthickkv02@gmail.com"
+      - key: SMTP_PASS
+        value: "hzsd iloq rgwq mbxm"
+      - key: NOTIFY_EMAIL
+        value: "karthickkv02@gmail.com"
+    healthCheckPath: /api/health

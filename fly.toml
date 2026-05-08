@@ -1,0 +1,39 @@
+# fly.toml — APSG (Staging Ground) Report
+# Generated for Fly.io deployment
+
+app = "apsg-report"
+primary_region = "sin"   # Singapore — change to your nearest region
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[mounts]
+  source = "apsg_data"
+  destination = "/app/data"
+
+[[services.http_checks]]
+  interval = "10s"
+  timeout = "5s"
+  grace_period = "30s"
+  method = "GET"
+  path = "/api/health"
