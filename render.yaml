@@ -9,18 +9,14 @@ services:
         generateValue: true
       - key: PORT
         value: "10000"
-      - key: RENDER
-        value: "true"
       - key: ADMIN_EMAIL
-        value: "karthickkv02@gmail.com"
+        value: ""          # Set to admin's email address
       - key: SMTP_HOST
         value: "smtp.gmail.com"
       - key: SMTP_PORT
         value: "587"
       - key: SMTP_USER
-        value: "karthickkv02@gmail.com"
+        value: ""          # Gmail/SMTP sender address
       - key: SMTP_PASS
-        value: "hzsd iloq rgwq mbxm"
-      - key: NOTIFY_EMAIL
-        value: "karthickkv02@gmail.com"
+        value: ""          # App password (not regular password)
     healthCheckPath: /api/health
