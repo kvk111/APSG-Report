@@ -9,10 +9,13 @@ import io, os, sys, traceback, pickle, hashlib
 from datetime import datetime
 from flask import Blueprint, request, jsonify, make_response, session, redirect, url_for, render_template_string
 
-# Make ct_module itself importable as a package path for its sibling modules
+# Make ct_module itself importable as a package path for its sibling modules.
+# IMPORTANT: use append, NOT insert(0, ...) — inserting at position 0 causes
+# ct_module/report_engine.py to shadow the root-level report_engine.py,
+# breaking the main app.py import on Render.
 _CT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _CT_DIR not in sys.path:
-    sys.path.insert(0, _CT_DIR)
+    sys.path.append(_CT_DIR)
 
 ct = Blueprint('ct', __name__, url_prefix='/ct')
 
