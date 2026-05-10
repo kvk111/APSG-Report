@@ -21,4 +21,4 @@ RUN mkdir -p uploads outputs
 EXPOSE 8080
 
 # Use gunicorn for production
-CMD ["sh", "-c", "python -c 'from app import init_db; init_db()' && gunicorn app:app --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 120 --preload"]
+CMD ["sh", "-c", "python -c 'from app import init_db; init_db()' && gunicorn app:app --bind 0.0.0.0:${PORT:-8080} --workers 1 --timeout 300 --worker-class sync"]
