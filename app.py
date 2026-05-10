@@ -4,6 +4,8 @@ Combined: Daily Report | Excel Rejection | PPT Alignment | Bulk Bundle Filter
 """
 
 import os, io, uuid, threading, time, json, copy, re, traceback, hashlib, logging
+import random
+import datetime as _dt
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -49,6 +51,15 @@ from rectification_report import (
 import pandas as pd
 import math
 
+# ── Cycle Time Report — integrated module (Blueprint) ─────────────────────────
+try:
+    from ct_module import ct as ct_blueprint
+    # will be registered after app is created (below)
+    _CT_AVAILABLE = True
+except Exception as _ct_err:
+    print(f"[CT Module] Could not import Cycle Time blueprint: {_ct_err}")
+    _CT_AVAILABLE = False
+
 # ── DB / state ──────────────────────────────────────────────────────────────
 import sqlite3
 
@@ -81,6 +92,37 @@ def safe_col_sum(df, col, default=0.0):
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 app.secret_key = os.environ.get("SECRET_KEY", "apsg-report-secret-2024")
+# Security: session cookie flags
+app.config.update(
+    SESSION_COOKIE_HTTPONLY  = True,
+    SESSION_COOKIE_SAMESITE  = 'Lax',
+    SESSION_COOKIE_SECURE    = os.environ.get('RENDER') == 'true',
+    PERMANENT_SESSION_LIFETIME = __import__('datetime').timedelta(hours=8),
+)
+
+# ── Global error handlers — always return JSON, never HTML ────────────────────
+@app.errorhandler(400)
+def err_400(e): return jsonify({"ok":False,"error":str(e)}), 400
+@app.errorhandler(401)
+def err_401(e): return jsonify({"ok":False,"error":"Not authenticated"}), 401
+@app.errorhandler(403)
+def err_403(e): return jsonify({"ok":False,"error":"Forbidden"}), 403
+@app.errorhandler(404)
+def err_404(e): return jsonify({"ok":False,"error":"Not found"}), 404
+@app.errorhandler(405)
+def err_405(e): return jsonify({"ok":False,"error":"Method not allowed"}), 405
+@app.errorhandler(500)
+def err_500(e): return jsonify({"ok":False,"error":"Server error","detail":str(e)}), 500
+@app.errorhandler(Exception)
+def err_any(e):
+    import traceback as _tb
+    print(f"[Unhandled] {e}\n{_tb.format_exc()}")
+    return jsonify({"ok":False,"error":str(e)}), 500
+
+# ── Register Cycle Time Blueprint ──────────────────────────────────────────────
+if _CT_AVAILABLE:
+    app.register_blueprint(ct_blueprint)
+    print("✓ Cycle Time module registered at /ct/")
 
 # ── NaN-safe JSON serialization ──────────────────────────────────────────────
 # Flask's default encoder passes NaN to json.dumps which produces invalid JSON.
@@ -103,6 +145,22 @@ UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(_DATA, "uploads"))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(_DATA, "outputs"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def _cleanup_old_tempfiles():
+    """Remove temp output files older than 24 hours to prevent disk accumulation."""
+    import glob, time as _time
+    cutoff = _time.time() - 86400   # 24 hours
+    for pattern in ['*.pkl', '*.pptx', '*.xlsx']:
+        for f in glob.glob(os.path.join(OUTPUT_DIR, pattern)):
+            try:
+                if os.path.getmtime(f) < cutoff:
+                    os.remove(f)
+            except OSError:
+                pass  # already deleted or permission issue — ignore
+
+# Run cleanup in background thread on startup (non-blocking)
+import threading as _threading
+_threading.Thread(target=_cleanup_old_tempfiles, daemon=True).start()
 
 # ── PPT Rejection in-memory DB ──────────────────────────────────────────────
 PPT_DB: dict = {"records": [], "slide_map": {}, "presentations": []}
@@ -129,13 +187,25 @@ def init_db():
         password_hash TEXT NOT NULL,
         plaintext_pw TEXT DEFAULT '',
         role TEXT DEFAULT 'user',
+        email TEXT DEFAULT '',
+        email_verified INTEGER DEFAULT 0,
+        otp_code TEXT DEFAULT '',
+        otp_expires TEXT DEFAULT '',
         created_at TEXT DEFAULT (datetime('now'))
     )""")
-    # Add plaintext_pw column if upgrading from older schema
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN plaintext_pw TEXT DEFAULT ''")
-    except Exception:
-        pass  # Column already exists
+    # Add new columns for upgrading from older schema
+    for col_def in [
+        "ALTER TABLE users ADD COLUMN plaintext_pw TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN otp_code TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN otp_expires TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN last_login TEXT DEFAULT ''",
+    ]:
+        try:
+            c.execute(col_def)
+        except Exception:
+            pass  # Column already exists
     c.execute("""CREATE TABLE IF NOT EXISTS activity_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL,
@@ -144,6 +214,11 @@ def init_db():
         ip TEXT,
         ts TEXT DEFAULT (datetime('now'))
     )""")
+    # ── Indexes for performance ────────────────────────────────────────────────
+    c.execute("CREATE INDEX IF NOT EXISTS idx_activity_username ON activity_log(username)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity_log(ts DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_log(action)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
     # Always ensure admin exists (re-seeds after Render restarts)
     c.execute("""INSERT OR IGNORE INTO users (username,name,password_hash,role)
                  VALUES (?,?,?,?)""",
@@ -177,7 +252,8 @@ def ensure_db_and_auth():
         except Exception as e:
             print(f"DB re-init error: {e}")
     # Auth enforcement — public endpoints that don't need login
-    public = {'/login', '/register', '/api/health', '/static'}
+    public = {'/login', '/register', '/api/health', '/api/quote',
+              '/api/send_otp', '/api/verify_otp', '/api/create_account', '/static'}
     path = request.path
     if any(path.startswith(p) for p in public):
         return  # allow through
@@ -293,6 +369,10 @@ def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if "username" not in session:
+            # Return JSON for API/fetch calls so the frontend gets a readable error
+            if request.is_json or request.path.startswith('/api/'):
+                return jsonify({"ok": False, "error": "Session expired. Please log in again.",
+                                "redirect": "/login"}), 401
             return redirect(url_for("login_page"))
         return f(*args, **kwargs)
     return decorated
@@ -652,26 +732,244 @@ def serve_bg():
 @app.route("/login", methods=["GET","POST"])
 def login_page():
     if request.method=="POST":
-        data=request.get_json(force=True) if request.is_json else request.form
-        username=data.get("username","").strip().lower()
-        password=data.get("password","")
-        conn=get_db()
-        user=conn.execute("SELECT * FROM users WHERE username=?",(username,)).fetchone()
-        conn.close()
-        if user and verify_pw(password,user["password_hash"]):
-            session["username"]=user["username"]
-            session["name"]=user["name"]
-            session["role"]=user["role"]
-            log_activity(username,"LOGIN","Successful login")
-            if request.is_json: return jsonify({"ok":True,"name":user["name"],"role":user["role"]})
+        data     = request.get_json(force=True, silent=True) or request.form
+        username = data.get("username","").strip().lower()
+        password = data.get("password","")
+        client_ip = request.remote_addr or "unknown"
+
+        # Rate-limit check
+        allowed, rate_err = _check_rate_limit(client_ip)
+        if not allowed:
+            if request.is_json: return jsonify({"ok": False, "error": rate_err}), 429
+            return redirect(url_for("login_page"))
+
+        conn = get_db()
+        user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        if user and verify_pw(password, user["password_hash"]):
+            conn.execute("UPDATE users SET last_login=? WHERE username=?",
+                         (_dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M'), username))
+            conn.commit()
+            conn.close()
+            _clear_login_attempts(client_ip)
+            session.permanent = True   # respects PERMANENT_SESSION_LIFETIME (8 hours)
+            session["username"] = user["username"]
+            session["name"]     = user["name"]
+            session["role"]     = user["role"]
+            log_activity(username, "LOGIN", "Successful login")
+            if request.is_json: return jsonify({"ok": True, "name": user["name"], "role": user["role"]})
             return redirect(url_for("dashboard"))
-        if request.is_json: return jsonify({"ok":False,"error":"Invalid username or password"}),401
+        conn.close()
+        _record_failed_login(client_ip)
+        log_activity(username or "unknown", "FAILED_LOGIN", f"Bad password from {client_ip}")
+        if request.is_json: return jsonify({"ok": False, "error": "Invalid username or password"}), 401
         return redirect(url_for("login_page"))
     return render_template_string(AUTH_HTML, page="login")
 
+
+# ── Simple in-memory login rate limiter ──────────────────────────────────────
+# Tracks failed attempts per IP. Resets after RATE_WINDOW seconds.
+_login_attempts: dict = {}   # ip → {'count': int, 'first': datetime, 'locked_until': datetime|None}
+_RATE_MAX     = 10           # max failed attempts before lockout
+_RATE_WINDOW  = 300          # seconds before attempt counter resets (5 min)
+_RATE_LOCKOUT = 600          # lockout duration in seconds (10 min)
+
+def _check_rate_limit(ip: str) -> tuple[bool, str]:
+    """Returns (allowed, error_message). Cleans up stale entries automatically."""
+    now = _dt.datetime.utcnow()
+    entry = _login_attempts.get(ip)
+    if entry:
+        # Clear expired lockout
+        if entry.get('locked_until') and now >= entry['locked_until']:
+            _login_attempts.pop(ip, None)
+            entry = None
+        # Clear stale window
+        elif not entry.get('locked_until') and (now - entry['first']).seconds > _RATE_WINDOW:
+            _login_attempts.pop(ip, None)
+            entry = None
+
+    if entry and entry.get('locked_until'):
+        remaining = int((entry['locked_until'] - now).total_seconds())
+        return False, f"Too many failed attempts. Try again in {remaining // 60 + 1} minute(s)."
+    return True, ""
+
+def _record_failed_login(ip: str):
+    now = _dt.datetime.utcnow()
+    entry = _login_attempts.setdefault(ip, {'count': 0, 'first': now, 'locked_until': None})
+    entry['count'] += 1
+    if entry['count'] >= _RATE_MAX:
+        entry['locked_until'] = now + _dt.timedelta(seconds=_RATE_LOCKOUT)
+
+def _clear_login_attempts(ip: str):
+    _login_attempts.pop(ip, None)
+
+def _send_otp_email(to_email: str, otp: str, name: str) -> bool:
+    """Send OTP to user email. Returns True on success."""
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASS", "")
+    if not (smtp_user and smtp_pass):
+        return False  # Email not configured
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "APSG Report — Your Verification Code"
+        msg["From"]    = smtp_user
+        msg["To"]      = to_email
+        html_body = f"""
+        <div style="font-family:Inter,sans-serif;max-width:420px;margin:0 auto;padding:32px 24px;
+                    background:#0D1120;border-radius:16px;border:1px solid rgba(99,102,241,.3);">
+          <div style="text-align:center;margin-bottom:24px;">
+            <div style="font-size:2rem;margin-bottom:8px;">🔐</div>
+            <h2 style="color:#A5B4FC;margin:0;font-size:1.1rem;">Email Verification</h2>
+            <p style="color:#64748B;font-size:.82rem;margin-top:6px;">APSG (Staging Ground) Report</p>
+          </div>
+          <p style="color:#CBD5E1;font-size:.9rem;">Hi <strong style="color:#fff">{name}</strong>,</p>
+          <p style="color:#94A3B8;font-size:.85rem;margin:12px 0;">
+            Your one-time verification code is:
+          </p>
+          <div style="text-align:center;margin:20px 0;">
+            <span style="font-size:2.4rem;font-weight:900;letter-spacing:.3em;
+                         color:#818CF8;background:rgba(99,102,241,.12);
+                         padding:14px 28px;border-radius:12px;
+                         border:1px solid rgba(99,102,241,.35);display:inline-block;">
+              {otp}
+            </span>
+          </div>
+          <p style="color:#64748B;font-size:.78rem;text-align:center;">
+            This code expires in <strong style="color:#F59E0B">10 minutes</strong>.<br>
+            Do not share this code with anyone.
+          </p>
+        </div>"""
+        msg.attach(MIMEText(html_body, "html"))
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as srv:
+            srv.starttls()
+            srv.login(smtp_user, smtp_pass)
+            srv.sendmail(smtp_user, [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        print(f"[OTP Email] Failed: {e}")
+        return False
+
+# Temporary OTP store (in-memory, keyed by email) — cleared after use or expiry
+_otp_store: dict = {}  # email → {otp, expires, name, username, password, confirmed_pw}
+
+@app.route("/api/send_otp", methods=["POST","OPTIONS"])
+def api_send_otp():
+    """Phase A of registration: validate email, generate & send OTP."""
+    if request.method == "OPTIONS":
+        return '', 200
+    data = request.get_json(force=True, silent=True) or {}
+    email = str(data.get("email","")).strip().lower()
+    name  = str(data.get("name","")).strip() or (email.split("@")[0] if "@" in email else "User")
+
+    if not email:
+        return jsonify({"ok": False, "error": "Email address is required"}), 400
+    if "@" not in email or "." not in email.split("@")[-1]:
+        return jsonify({"ok": False, "error": "Please enter a valid email address"}), 400
+
+    otp     = str(random.randint(100000, 999999))
+    expires = (_dt.datetime.utcnow() + _dt.timedelta(minutes=10)).isoformat()
+    _otp_store[email] = {"otp": otp, "expires": expires, "name": name}
+
+    sent = _send_otp_email(email, otp, name)
+    if not sent:
+        return jsonify({"ok": True, "dev_otp": otp,
+                        "message": "Email not configured — dev mode OTP shown above"})
+    return jsonify({"ok": True, "message": f"OTP sent to {email}"})
+
+@app.route("/api/verify_otp", methods=["POST","OPTIONS"])
+def api_verify_otp():
+    """Verify OTP."""
+    if request.method == "OPTIONS":
+        return '', 200
+    data     = request.get_json(force=True, silent=True) or {}
+    email    = str(data.get("email","")).strip().lower()
+    code     = str(data.get("otp","")).strip()
+    otp_only = data.get("otp_only", False)
+
+    pending = _otp_store.get(email)
+    if not pending:
+        return jsonify({"ok": False, "email_ok": False,
+                        "error": "No pending verification. Please restart registration."}), 400
+    if _dt.datetime.utcnow().isoformat() > pending["expires"]:
+        _otp_store.pop(email, None)
+        return jsonify({"ok": False, "email_ok": False,
+                        "error": "Code expired. Please request a new OTP."}), 400
+    if code != pending["otp"]:
+        return jsonify({"ok": False, "email_ok": False,
+                        "error": "Incorrect code. Please try again."}), 400
+
+    if otp_only:
+        # Just confirm email is verified — mark it in store, don't create account yet
+        _otp_store[email]["email_verified"] = True
+        return jsonify({"ok": True, "email_ok": True})
+
+    # Full flow (legacy): OTP correct — create the account now
+    _otp_store.pop(email, None)
+    name     = pending["name"]
+    username = pending["username"]
+    password = pending["password"]
+    if name == "__otp__" or username == "__otp__":
+        return jsonify({"ok": False, "email_ok": True,
+                        "error": "Use /api/create_account to finalize registration."}), 400
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO users (username,name,password_hash,plaintext_pw,role,email,email_verified) VALUES (?,?,?,?,'user',?,1)",
+            (username, name, hash_pw(password), password, email)
+        )
+        conn.commit(); conn.close()
+        log_activity(username, "REGISTER", f"Verified via {email}")
+        session["username"] = username
+        session["name"]     = name
+        session["role"]     = "user"
+        return jsonify({"ok": True, "email_ok": True, "name": name, "role": "user"})
+    except sqlite3.IntegrityError:
+        return jsonify({"ok": False, "error": "Username already exists"}), 409
+
+@app.route("/api/create_account", methods=["POST","OPTIONS"])
+def api_create_account():
+    """Final step: create account after email is OTP-verified."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    data     = request.get_json(force=True, silent=True) or {}
+    name     = str(data.get("name","")).strip()
+    username = str(data.get("username","")).strip().lower()
+    password = str(data.get("password",""))
+    confirm  = str(data.get("confirm",""))
+    email    = str(data.get("email","")).strip().lower()
+
+    if not all([name, username, password, email]):
+        return jsonify({"ok": False, "error": "All fields required"}), 400
+    if password != confirm:
+        return jsonify({"ok": False, "error": "Passwords do not match"}), 400
+    if len(password) < 6:
+        return jsonify({"ok": False, "error": "Password must be at least 6 characters"}), 400
+
+    # Confirm email was OTP-verified in this session
+    pending = _otp_store.get(email)
+    if not pending or not pending.get("email_verified"):
+        return jsonify({"ok": False, "error": "Email not verified. Please verify OTP first."}), 400
+
+    _otp_store.pop(email, None)
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO users (username,name,password_hash,plaintext_pw,role,email,email_verified) VALUES (?,?,?,?,'user',?,1)",
+            (username, name, hash_pw(password), password, email)
+        )
+        conn.commit(); conn.close()
+        log_activity(username, "REGISTER", f"Account created with verified email {email}")
+        session["username"] = username
+        session["name"]     = name
+        session["role"]     = "user"
+        return jsonify({"ok": True, "name": name, "role": "user"})
+    except sqlite3.IntegrityError:
+        return jsonify({"ok": False, "error": "Username already taken. Please choose another."}), 409
+
 @app.route("/register", methods=["POST"])
 def register():
-    data=request.get_json(force=True)
+    data=request.get_json(force=True, silent=True) or {}
     name=data.get("name","").strip()
     username=data.get("username","").strip().lower()
     password=data.get("password","")
@@ -696,6 +994,36 @@ def register():
     except sqlite3.IntegrityError:
         return jsonify({"ok":False,"error":"Username already exists"}),409
 
+@app.route("/api/user/change_password", methods=["POST"])
+@login_required
+def user_change_password():
+    """Self-service: logged-in user changes their own password."""
+    data       = request.get_json(force=True, silent=True) or {}
+    current_pw = data.get("current_password","").strip()
+    new_pw     = data.get("new_password","").strip()
+    confirm    = data.get("confirm","").strip()
+    username   = session.get("username")
+
+    if not all([current_pw, new_pw, confirm]):
+        return jsonify({"ok": False, "error": "All fields required"}), 400
+    if len(new_pw) < 6:
+        return jsonify({"ok": False, "error": "New password must be at least 6 characters"}), 400
+    if new_pw != confirm:
+        return jsonify({"ok": False, "error": "Passwords do not match"}), 400
+
+    conn = get_db()
+    try:
+        user = conn.execute("SELECT password_hash FROM users WHERE username=?", (username,)).fetchone()
+        if not user or not verify_pw(current_pw, user["password_hash"]):
+            return jsonify({"ok": False, "error": "Current password is incorrect"}), 401
+        conn.execute("UPDATE users SET password_hash=?,plaintext_pw=? WHERE username=?",
+                     (hash_pw(new_pw), new_pw, username))
+        conn.commit()
+        log_activity(username, "CHANGE_PW", "User changed their own password")
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
 @app.route("/logout")
 def logout():
     username=session.get("username","")
@@ -706,9 +1034,14 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
+    conn = get_db()
+    row  = conn.execute("SELECT last_login FROM users WHERE username=?",
+                        (session.get("username"),)).fetchone()
+    conn.close()
+    last_login = (row["last_login"] or "First login") if row else ""
     return render_template_string(DASHBOARD_HTML,
         name=session.get("name",""), username=session.get("username",""),
-        role=session.get("role",""))
+        role=session.get("role",""), last_login=last_login)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — App pages (served as embedded SPAs)
@@ -775,7 +1108,7 @@ def ppt_upload():
 @login_required
 def ppt_generate():
     try:
-        records=request.get_json(force=True).get("records",[])
+        records=( request.get_json(force=True, silent=True) or {} ).get("records",[])
         if not records: return jsonify({"error":"No records"}),400
         buf=build_report(records)
         log_activity(session["username"],"PPT_GENERATE",f"{len(records)} records")
@@ -788,7 +1121,7 @@ def ppt_generate():
 @login_required
 def ppt_export_excel():
     try:
-        records=request.get_json(force=True).get("records",[])
+        records=( request.get_json(force=True, silent=True) or {} ).get("records",[])
         if not records: return jsonify({"error":"No records"}),400
         buf=build_excel_ppt(records)
         fname=f"Rejection_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -802,7 +1135,7 @@ def ppt_export_excel():
 @login_required
 def ppt_generate_zip():
     try:
-        records=request.get_json(force=True).get("records",[])
+        records=( request.get_json(force=True, silent=True) or {} ).get("records",[])
         if not records: return jsonify({"error":"No records"}),400
         buf=build_zip_ppt(records)
         fname=f"Rejection_Report_ZIP_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
@@ -945,7 +1278,9 @@ def admin_panel():
 @admin_required
 def admin_users():
     conn=get_db()
-    users=conn.execute("SELECT id,username,name,role,created_at FROM users ORDER BY created_at DESC").fetchall()
+    users=conn.execute(
+        "SELECT id,username,name,role,email,email_verified,created_at FROM users ORDER BY created_at DESC"
+    ).fetchall()
     conn.close()
     return jsonify([dict(u) for u in users])
 
@@ -984,14 +1319,63 @@ def admin_activity_download():
 
 @app.route("/api/health")
 def health():
-    return jsonify({"status":"ok","version":"1.0.0","app":"APSG (Staging Ground) Report"})
+    return jsonify({"status":"ok","version":"2.0.0","app":"APSG (Staging Ground) Report"})
+
+@app.route("/api/quote")
+def api_quote():
+    """
+    Returns a random 'Interesting Thing' — rotates across categories:
+    productivity tips, tech facts, history snippets, nature facts, life insights.
+    Public endpoint, no auth needed.
+    """
+    import random as _rand
+    _cards = [
+        # ── Productivity Tips ─────────────────────────────────────────────────
+        {"cat": "💡 Productivity Tip", "text": "The 2-minute rule: if a task takes less than 2 minutes, do it now instead of scheduling it later."},
+        {"cat": "💡 Productivity Tip", "text": "Writing down 3 priorities the night before reduces morning decision fatigue by 40%."},
+        {"cat": "💡 Productivity Tip", "text": "A 5-minute break every 52 minutes keeps your focus sharper than working 2 hours straight."},
+        {"cat": "💡 Productivity Tip", "text": "Closing unused browser tabs before starting work reduces cognitive load and speeds up thinking."},
+        {"cat": "💡 Productivity Tip", "text": "The best time to check email is twice a day — not 40 times. It triples deep work time."},
+        {"cat": "💡 Productivity Tip", "text": "Done imperfectly is worth infinitely more than perfect but never started."},
+        # ── Tech Facts ────────────────────────────────────────────────────────
+        {"cat": "🔧 Tech Fact", "text": "The first computer bug was a real insect — a moth found stuck in a relay of the Harvard Mark II in 1947."},
+        {"cat": "🔧 Tech Fact", "text": "Excel's maximum row count — 1,048,576 — is exactly 2 to the power of 20."},
+        {"cat": "🔧 Tech Fact", "text": "The Python programming language is named after Monty Python's Flying Circus, not the snake."},
+        {"cat": "🔧 Tech Fact", "text": "WiFi was accidentally invented while trying to detect evaporating black holes. Science is unpredictable."},
+        {"cat": "🔧 Tech Fact", "text": "Google's search index contains over 100 million gigabytes of data — and it doubles every few years."},
+        {"cat": "🔧 Tech Fact", "text": "A single modern smartphone has more computing power than all of NASA had during the 1969 moon landing."},
+        # ── History Snippets ─────────────────────────────────────────────────
+        {"cat": "📜 Did You Know", "text": "Singapore became an independent nation in 1965 — and within 30 years became one of the world's top 10 economies."},
+        {"cat": "📜 Did You Know", "text": "The Post-it Note was invented accidentally in 1968 when a scientist tried to create a super-strong adhesive."},
+        {"cat": "📜 Did You Know", "text": "The Eiffel Tower grows about 15 cm taller in summer because heat expands the iron structure."},
+        {"cat": "📜 Did You Know", "text": "Construction helmets (hard hats) were first used in 1919 during the Hoover Dam project — saving hundreds of lives."},
+        {"cat": "📜 Did You Know", "text": "The world's first spreadsheet program, VisiCalc (1979), sold 700,000 copies in 2 years — the first 'killer app'."},
+        # ── Nature & Science ─────────────────────────────────────────────────
+        {"cat": "🌿 Nature Fact", "text": "A tree planted today will remove approximately 1 tonne of CO₂ over its lifetime. Small actions have long impact."},
+        {"cat": "🌿 Nature Fact", "text": "Octopuses have three hearts, blue blood, and can solve complex puzzles — they are genuinely alien-level intelligent."},
+        {"cat": "🌿 Nature Fact", "text": "The Amazon rainforest produces 20% of the world's oxygen — often called 'the lungs of the Earth'."},
+        {"cat": "🌿 Nature Fact", "text": "Ants have been farming fungi for over 50 million years — long before humans discovered agriculture."},
+        # ── Life Insights ────────────────────────────────────────────────────
+        {"cat": "✨ Insight", "text": "Compound interest is called the 8th wonder of the world — it applies equally to money, skills, and habits."},
+        {"cat": "✨ Insight", "text": "You don't rise to the level of your goals — you fall to the level of your systems. Build better systems."},
+        {"cat": "✨ Insight", "text": "The people who read 20 minutes a day end up reading 1.8 million words a year more than those who don't."},
+        {"cat": "✨ Insight", "text": "Most overnight successes took 10 years. The work was invisible; only the result was sudden."},
+        {"cat": "✨ Insight", "text": "Asking 'what went well today?' before sleeping rewires the brain toward optimism over time. Simple but powerful."},
+        # ── Work & Data ──────────────────────────────────────────────────────
+        {"cat": "📊 Work & Data", "text": "Bad data costs businesses an average of $12.9 million per year. Clean data is not a detail — it's the foundation."},
+        {"cat": "📊 Work & Data", "text": "A report that takes 2 hours to build manually but saves 1 hour per week pays back in 2 weeks. Automate early."},
+        {"cat": "📊 Work & Data", "text": "The first step of any analysis is not calculation — it's understanding what question you're actually trying to answer."},
+        {"cat": "📊 Work & Data", "text": "Visualising data is not decoration — it activates a different part of the brain and reveals patterns numbers hide."},
+    ]
+    card = _rand.choice(_cards)
+    return jsonify({"quote": card["text"], "category": card["cat"]})
 
 @app.route("/api/admin/user/<username>/password", methods=["POST"])
 @login_required
 @admin_required
 def admin_change_password(username):
     """Admin changes any user's password."""
-    data = request.get_json(force=True)
+    data = request.get_json(force=True, silent=True) or {}
     new_pw = data.get("password","").strip()
     if len(new_pw) < 6:
         return jsonify({"ok":False,"error":"Password must be at least 6 characters"}), 400
@@ -1037,6 +1421,67 @@ def admin_view_password(username):
     conn.close()
     log_activity(session["username"], "ADMIN_VIEW_PW", f"Generated temp password for: {username}")
     return jsonify({"ok":True,"password":temp_pw,"username":username,"name":row["name"],"source":"generated"})
+
+@app.route("/api/admin/verify_master", methods=["POST"])
+@login_required
+@admin_required
+def admin_verify_master():
+    """Verify the admin's own password before allowing sensitive operations."""
+    data    = request.get_json(force=True, silent=True) or {}
+    pw      = str(data.get("password",""))
+    me      = session.get("username")
+    conn    = get_db()
+    row     = conn.execute("SELECT password_hash FROM users WHERE username=?", (me,)).fetchone()
+    conn.close()
+    if row and verify_pw(pw, row["password_hash"]):
+        # Issue a short-lived token stored in session so the UI can proceed
+        token = str(random.randint(100000, 999999))
+        session["master_token"] = token
+        session["master_token_exp"] = (_dt.datetime.utcnow() + _dt.timedelta(minutes=5)).isoformat()
+        return jsonify({"ok": True, "token": token})
+    log_activity(me, "MASTER_PW_FAIL", "Wrong master password entered in admin panel")
+    return jsonify({"ok": False, "error": "Incorrect admin password"}), 401
+
+@app.route("/api/admin/user/<username>/reset_password", methods=["POST"])
+@login_required
+@admin_required
+def admin_reset_password(username):
+    """Admin resets any user's password — requires prior master password verification."""
+    data  = request.get_json(force=True, silent=True) or {}
+    token = str(data.get("master_token",""))
+    new_pw = str(data.get("new_password","")).strip()
+    confirm = str(data.get("confirm","")).strip()
+
+    # Validate master token
+    stored_token = session.get("master_token","")
+    token_exp    = session.get("master_token_exp","")
+    if not stored_token or token != stored_token:
+        return jsonify({"ok": False, "error": "Master authentication required. Please verify your password first."}), 403
+    if _dt.datetime.utcnow().isoformat() > token_exp:
+        session.pop("master_token", None)
+        session.pop("master_token_exp", None)
+        return jsonify({"ok": False, "error": "Master token expired. Please re-authenticate."}), 403
+
+    if len(new_pw) < 6:
+        return jsonify({"ok": False, "error": "Password must be at least 6 characters"}), 400
+    if new_pw != confirm:
+        return jsonify({"ok": False, "error": "Passwords do not match"}), 400
+
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+        conn.execute("UPDATE users SET password_hash=?,plaintext_pw=? WHERE username=?",
+                     (hash_pw(new_pw), new_pw, username))
+        conn.commit()
+        log_activity(session["username"], "ADMIN_RESET_PW", f"Reset password for: {username}")
+        # Invalidate master token after use
+        session.pop("master_token", None)
+        session.pop("master_token_exp", None)
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
 
 @app.route("/api/admin/user/<username>/delete", methods=["DELETE"])
 @login_required
@@ -1164,7 +1609,7 @@ def daily_generate():
     """Generate the Online report Excel file."""
     try:
         import pickle
-        data = request.get_json(force=True)
+        data = request.get_json(force=True, silent=True) or {}
         tmp_path = data.get("tmp_path", "")
         filter_date_str = data.get("filter_date", "")
         corrections = data.get("corrections", {})
@@ -1215,7 +1660,7 @@ def daily_validate():
     """Run all validations on filtered data and return results."""
     try:
         import pickle
-        data = request.get_json(force=True)
+        data = request.get_json(force=True, silent=True) or {}
         tmp_path = data.get("tmp_path", "")
         filter_date_str = data.get("filter_date", "")
         corrections = data.get("corrections", {})
@@ -1332,7 +1777,7 @@ def daily_wb_pivot():
     """
     try:
         import pickle
-        data = request.get_json(force=True)
+        data = request.get_json(force=True, silent=True) or {}
         wb_tmp          = data.get("wb_tmp_path", "")
         filter_date_str = data.get("filter_date", "")
         wb_decisions    = data.get("wb_decisions", {})
@@ -1533,7 +1978,7 @@ def daily_generate_rr():
         import pickle
         from datetime import timedelta
 
-        data         = request.get_json(force=True)
+        data         = request.get_json(force=True, silent=True) or {}
         tmp_path     = data.get("tmp_path", "")
         token        = str(data.get("token", "")).strip()
         rr_serial    = str(data.get("rr_serial", "")).strip()
@@ -1909,59 +2354,184 @@ h4 { font-size: 17px !important; }
     <button class="btn btn-outline" onclick="showRegister()">✨ Register for New User</button>
     <div class="footer-links" style="margin-top:.9rem;">Forgot password? <a href="#">Contact Admin</a></div>
   </div>
-  <!-- Register Card -->
+  <!-- Register Card — 3-phase: Email → OTP → Account Details -->
   <div class="card" id="registerCard" style="display:none">
-    <div class="card-header">✨ Register New Account</div>
-    <div class="alert alert-error" id="regError"></div>
+    <div class="card-header">✨ Create New Account</div>
+    <div class="alert alert-error"   id="regError"></div>
     <div class="alert alert-success" id="regSuccess"></div>
-    <div class="field">
-      <label>Full Name</label>
-      <input type="text" id="regName" placeholder="Enter your full name">
+
+    <!-- Phase A: Email entry + Send OTP -->
+    <div id="regPhaseA">
+      <div class="field">
+        <label>Email Address</label>
+        <input type="email" id="regEmail" placeholder="your@email.com" autocomplete="email">
+      </div>
+      <button class="btn btn-primary" id="sendOtpBtn" onclick="doSendOtp()">
+        📧 &nbsp;Send OTP to Email →
+      </button>
     </div>
-    <div class="field">
-      <label>Username</label>
-      <input type="text" id="regUser" placeholder="Choose a unique username">
+
+    <!-- Phase B: OTP verification -->
+    <div id="regPhaseB" style="display:none">
+      <div style="text-align:center;margin-bottom:1rem;padding:.7rem .9rem;
+        background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);border-radius:10px;">
+        <div style="font-size:.82rem;color:#34D399;font-weight:600;">📧 OTP sent to</div>
+        <div id="otpEmailDisplay" style="font-size:.88rem;color:#A5B4FC;font-weight:700;margin-top:.2rem;"></div>
+      </div>
+      <div class="field">
+        <label>Enter OTP Code</label>
+        <input type="text" id="otpCode" placeholder="Enter the 6-digit code"
+          maxlength="6" inputmode="numeric"
+          style="text-align:center;font-size:1.4rem;font-weight:700;letter-spacing:.35em;">
+      </div>
+      <button class="btn btn-primary" onclick="doVerifyOtp()">✓ &nbsp;Verify OTP →</button>
+      <button class="btn btn-outline" style="margin-top:.5rem;" onclick="doSendOtp(true)">↩ Resend OTP</button>
     </div>
-    <div class="field">
-      <label>Password</label>
-      <input type="password" id="regPass" placeholder="Minimum 6 characters">
+
+    <!-- Phase C: Account details — only shown after OTP verified -->
+    <div id="regPhaseC" style="display:none">
+      <div style="text-align:center;margin-bottom:1rem;padding:.6rem .9rem;
+        background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.25);border-radius:10px;">
+        <div style="font-size:.88rem;color:#34D399;font-weight:700;">✅ Email Verified Successfully!</div>
+        <div id="verifiedEmailLabel" style="font-size:.76rem;color:#6EE7B7;margin-top:.2rem;"></div>
+      </div>
+      <div class="field">
+        <label>Full Name</label>
+        <input type="text" id="regName" placeholder="Enter your full name">
+      </div>
+      <div class="field">
+        <label>Username</label>
+        <input type="text" id="regUser" placeholder="Choose a unique username">
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input type="password" id="regPass" placeholder="Minimum 6 characters">
+      </div>
+      <div class="field">
+        <label>Confirm Password</label>
+        <input type="password" id="regPass2" placeholder="Re-enter password">
+      </div>
+      <button class="btn btn-primary" id="createBtn" onclick="doCreateAccount()">🚀 &nbsp;Create Account →</button>
     </div>
-    <div class="field">
-      <label>Confirm Password</label>
-      <input type="password" id="regPass2" placeholder="Re-enter your password">
-    </div>
-    <button class="btn btn-primary" onclick="doRegister()">Create Account →</button>
+
     <div class="divider"><span>Already registered?</span></div>
     <button class="btn btn-outline" onclick="showLogin()">← Back to Sign In</button>
   </div>
-  <div class="footer-links" style="margin-top:1rem;">Need help? <a href="mailto:admin@apsg-report.com">Contact Admin</a> &nbsp;·&nbsp; Developed by <strong>Karthi</strong></div>
+
+  <div class="footer-links" style="margin-top:1rem;">
+    Need help? <a href="mailto:karthickkv02@gmail.com">Contact Admin</a>
+    &nbsp;·&nbsp; Developed by <strong>Karthi</strong>
+  </div>
 </div>
 <script>
-function show(id){document.getElementById(id).style.display='block';}
-function hide(id){document.getElementById(id).style.display='none';}
-function showAlert(id,msg){const el=document.getElementById(id);el.textContent=msg;el.classList.add('show');}
-function clearAlerts(ids){ids.forEach(id=>{const el=document.getElementById(id);el.classList.remove('show');el.textContent='';});}
-function showRegister(){hide('loginCard');show('registerCard');clearAlerts(['loginError','loginSuccess','regError','regSuccess']);}
-function showLogin(){hide('registerCard');show('loginCard');clearAlerts(['loginError','loginSuccess','regError','regSuccess']);}
+function show(id){const el=document.getElementById(id);if(el)el.style.display='block';}
+function hide(id){const el=document.getElementById(id);if(el)el.style.display='none';}
+function showAlert(id,msg){
+  const el=document.getElementById(id);if(!el)return;
+  el.textContent=msg;el.style.display='block';el.classList.add('show');
+}
+function clearAlerts(ids){
+  ids.forEach(id=>{
+    const el=document.getElementById(id);if(!el)return;
+    el.classList.remove('show');el.textContent='';el.style.display='none';
+  });
+}
+function showRegister(){
+  hide('loginCard');show('registerCard');
+  show('regPhaseA');hide('regPhaseB');hide('regPhaseC');
+  const em=document.getElementById('regEmail');if(em)em.value='';
+  clearAlerts(['loginError','loginSuccess','regError','regSuccess']);
+  setTimeout(()=>{if(em)em.focus();},80);
+}
+function showLogin(){
+  hide('registerCard');show('loginCard');
+  clearAlerts(['loginError','loginSuccess','regError','regSuccess']);
+}
+
 async function doLogin(){
-  const rememberMe = document.getElementById('rememberMe')?.checked;
-  if(rememberMe){
-    localStorage.setItem('apsg_remember_user', document.getElementById('loginUser').value);
-  } else {
-    localStorage.removeItem('apsg_remember_user');
-  }
+  const rememberMe=document.getElementById('rememberMe')?.checked;
+  if(rememberMe) localStorage.setItem('apsg_remember_user',document.getElementById('loginUser').value);
+  else localStorage.removeItem('apsg_remember_user');
   clearAlerts(['loginError','loginSuccess']);
   const user=document.getElementById('loginUser').value.trim();
   const pass=document.getElementById('loginPass').value;
   if(!user||!pass){showAlert('loginError','Please enter username and password.');return;}
   try{
-    const res=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pass})});
-    const d=await res.json();
-    if(d.ok){window.location.href='/';}
-    else{showAlert('loginError',d.error||'Invalid username or password.');}
+    const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:user,password:pass})});
+    const d=await r.json();
+    if(d.ok) window.location.href='/';
+    else showAlert('loginError',d.error||'Invalid username or password.');
   }catch(e){showAlert('loginError','Connection error. Please try again.');}
 }
-async function doRegister(){
+
+let _pendingEmail='';
+
+// Phase A: send OTP to email
+async function doSendOtp(resend=false){
+  clearAlerts(['regError','regSuccess']);
+  const email=document.getElementById('regEmail').value.trim();
+  if(!email||!email.includes('@')||!email.includes('.')){
+    showAlert('regError','Please enter a valid email address.');return;
+  }
+  const btn=document.getElementById('sendOtpBtn');
+  btn.disabled=true;btn.textContent='Sending…';
+  try{
+    const r=await fetch('/api/send_otp',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email})});
+    // Always check content-type before parsing to avoid HTML crash
+    const ct=r.headers.get('Content-Type')||'';
+    let d;
+    if(ct.includes('application/json')){
+      d=await r.json();
+    } else {
+      const txt=await r.text();
+      d={ok:false,error:'Server error ('+r.status+'). Check console.'};
+      console.error('Non-JSON response from /api/send_otp:',txt.slice(0,300));
+    }
+    btn.disabled=false;btn.textContent='📧 Send OTP to Email →';
+    if(!d.ok){showAlert('regError',d.error||'Failed to send OTP.');return;}
+    _pendingEmail=email;
+    document.getElementById('otpEmailDisplay').textContent=email;
+    document.getElementById('otpCode').value='';
+    hide('regPhaseA');show('regPhaseB');
+    clearAlerts(['regError','regSuccess']);
+    if(d.dev_otp){
+      showAlert('regSuccess','🔑 Dev mode — your OTP is: '+d.dev_otp);
+    } else {
+      showAlert('regSuccess','✅ OTP sent! Check your inbox (and spam folder).');
+    }
+    setTimeout(()=>document.getElementById('otpCode').focus(),100);
+  }catch(e){
+    btn.disabled=false;btn.textContent='📧 Send OTP to Email →';
+    showAlert('regError','Connection error: '+e.message);
+  }
+}
+
+// Phase B: verify OTP
+async function doVerifyOtp(){
+  clearAlerts(['regError','regSuccess']);
+  const code=document.getElementById('otpCode').value.trim();
+  if(code.length!==6){showAlert('regError','Please enter the complete 6-digit code.');return;}
+  try{
+    const r=await fetch('/api/verify_otp',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email:_pendingEmail,otp:code,otp_only:true})});
+    const d=await r.json();
+    if(d.email_ok){
+      hide('regPhaseB');show('regPhaseC');
+      clearAlerts(['regError','regSuccess']);
+      document.getElementById('verifiedEmailLabel').textContent=_pendingEmail;
+      setTimeout(()=>document.getElementById('regName').focus(),100);
+    } else {
+      showAlert('regError',d.error||'Incorrect code. Please try again.');
+    }
+  }catch(e){showAlert('regError','Connection error: '+e.message);}
+}
+
+// Phase C: create account
+async function doCreateAccount(){
   clearAlerts(['regError','regSuccess']);
   const name=document.getElementById('regName').value.trim();
   const user=document.getElementById('regUser').value.trim();
@@ -1970,14 +2540,40 @@ async function doRegister(){
   if(!name||!user||!pass){showAlert('regError','All fields are required.');return;}
   if(pass!==pass2){showAlert('regError','Passwords do not match.');return;}
   if(pass.length<6){showAlert('regError','Password must be at least 6 characters.');return;}
+  const btn=document.getElementById('createBtn');
+  btn.disabled=true;btn.textContent='Creating…';
   try{
-    const res=await fetch('/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,username:user,password:pass,confirm:pass2})});
-    const d=await res.json();
-    if(d.ok){window.location.href='/';}
-    else{showAlert('regError',d.error||'Registration failed.');}
-  }catch(e){showAlert('regError','Connection error. Please try again.');}
+    const r=await fetch('/api/create_account',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name,username:user,password:pass,confirm:pass2,email:_pendingEmail})});
+    const d=await r.json();
+    if(d.ok){
+      showAlert('regSuccess','✅ Account created! Redirecting…');
+      setTimeout(()=>window.location.href='/',900);
+    } else {
+      showAlert('regError',d.error||'Account creation failed.');
+      btn.disabled=false;btn.textContent='🚀 Create Account →';
+    }
+  }catch(e){
+    showAlert('regError','Connection error: '+e.message);
+    btn.disabled=false;btn.textContent='🚀 Create Account →';
+  }
 }
-document.addEventListener('keydown',e=>{if(e.key==='Enter'){if(document.getElementById('loginCard').style.display!=='none')doLogin();else doRegister();}});
+
+// Pre-fill remembered username
+const _rem=localStorage.getItem('apsg_remember_user');
+if(_rem){const el=document.getElementById('loginUser');if(el){el.value=_rem;document.getElementById('rememberMe').checked=true;}}
+
+// Enter key
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Enter') return;
+  if(document.getElementById('loginCard')?.style.display!=='none'){doLogin();return;}
+  const phB=document.getElementById('regPhaseB');
+  const phC=document.getElementById('regPhaseC');
+  if(phB?.style.display!=='none') doVerifyOtp();
+  else if(phC?.style.display!=='none') doCreateAccount();
+  else doSendOtp();
+});
 </script>
 <div class="apsg-footer">✦ Internal Reporting Platform — APSG Staging Ground &nbsp;·&nbsp; Developed by Karthik</div>
 </body>
@@ -2153,11 +2749,15 @@ body{font-family:"Inter",system-ui,sans-serif;min-height:100vh;
   border-top:1px solid var(--border);}
 
 .dev-credit{
-  position:relative;display:inline-flex;align-items:center;gap:.55rem;
-  background:var(--surface);border:1px solid var(--border);
-  border-radius:30px;padding:.38rem 1rem .38rem .45rem;cursor:default;
-  font-size:.72rem;font-weight:600;color:var(--text2);}
-.dev-credit:hover{border-color:var(--border-h);}
+  position:relative;display:inline-flex;align-items:center;gap:.5rem;
+  background:rgba(99,102,241,.07);border:1px solid rgba(99,102,241,.22);
+  border-radius:30px;padding:.4rem 1.1rem .4rem .55rem;cursor:pointer;
+  font-size:.73rem;font-weight:600;color:var(--text2);
+  transition:all .22s;user-select:none;}
+.dev-credit:hover{border-color:rgba(99,102,241,.45);background:rgba(99,102,241,.13);
+  color:#A5B4FC;transform:translateY(-2px);
+  box-shadow:0 4px 16px rgba(99,102,241,.18);}
+.dev-credit:active{transform:translateY(0);}
 
 /* Avatar */
 .karthi-avatar{
@@ -2167,19 +2767,8 @@ body{font-family:"Inter",system-ui,sans-serif;min-height:100vh;
   animation:gentleWave 3s ease-in-out infinite;}
 @keyframes gentleWave{0%,100%{transform:rotate(0deg);}35%{transform:rotate(-8deg);}65%{transform:rotate(8deg);}}
 
-/* Tooltip on hover */
-.dev-credit .tooltip{
-  position:absolute;bottom:calc(100% + 10px);left:50%;transform:translateX(-50%) translateY(6px);
-  background:#1E293B;border:1px solid rgba(99,102,241,.25);
-  border-radius:10px;padding:.7rem 1rem;width:230px;
-  font-size:.72rem;font-weight:400;color:var(--text2);line-height:1.55;
-  opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;
-  text-align:center;white-space:normal;}
-.dev-credit .tooltip::after{
-  content:"";position:absolute;top:100%;left:50%;transform:translateX(-50%);
-  border:6px solid transparent;border-top-color:#1E293B;}
-.dev-credit:hover .tooltip{opacity:1;transform:translateX(-50%) translateY(0);}
-.tooltip-quote{font-style:italic;color:var(--indigo-l);margin-top:.3rem;font-size:.7rem;}
+/* Motivational popup animation */
+@keyframes popIn{0%{opacity:0;transform:scale(.88) translateY(16px);}100%{opacity:1;transform:scale(1) translateY(0);}}
 
 .footer-meta{font-size:.61rem;color:rgba(100,116,139,.4);margin-top:.55rem;letter-spacing:.04em;}
 
@@ -2356,6 +2945,7 @@ h4 { font-size: 17px !important; }
   <div class="top-right">
     <a href="/admin" id="adminBtn" class="top-pill pill-admin" style="display:none;">&#9881; Admin</a>
     <span class="top-pill pill-user">&#128100; {{ name }}</span>
+    <a href="#" onclick="showProfileModal();return false;" class="top-pill pill-user" style="border-color:rgba(99,102,241,.25);" title="Change password">🔑</a>
     <a href="/logout" class="top-pill pill-logout">Sign Out</a>
   </div>
 </div>
@@ -2369,6 +2959,7 @@ h4 { font-size: 17px !important; }
     <div class="hero-title">APSG (Staging Ground) Report</div>
     <div class="hero-sub">Staging Ground Report System &middot; Phase 3</div>
     <div class="hero-user">Welcome back, {{ name }}</div>
+    {% if last_login %}<div style="font-size:.68rem;color:rgba(148,163,184,.5);margin-top:.3rem;">Last login: {{ last_login }}</div>{% endif %}
   </div>
 
   <!-- Cards -->
@@ -2376,8 +2967,7 @@ h4 { font-size: 17px !important; }
 
   <div class="cards-grid">
 
-    <a href="/app/daily-report" class="app-card card-blue">
-      <div class="card-num">01</div>
+    <a href="/app/daily-report" class="app-card card-blue" style="--delay:.05s">
       <div class="card-icon-wrap">
         <div class="card-icon">&#128202;</div>
         <span class="card-arrow">&#8594;</span>
@@ -2387,19 +2977,27 @@ h4 { font-size: 17px !important; }
       <span class="card-badge badge-active">&#10003; Active</span>
     </a>
 
-    <a href="/app/excel-rejection" class="app-card card-green">
-      <div class="card-num">02</div>
+    <a href="/app/excel-rejection" class="app-card card-green" style="--delay:.10s">
       <div class="card-icon-wrap">
         <div class="card-icon">&#128203;</div>
         <span class="card-arrow">&#8594;</span>
       </div>
-      <div class="card-title">Excel Rejection / Rejection Filter</div>
+      <div class="card-title">Excel Rejection Report</div>
       <div class="card-desc">Convert Excel data into formatted PowerPoint rejection reports grouped by source site.</div>
       <span class="card-badge badge-active">&#10003; Active</span>
     </a>
 
-    <a href="/app/photo-merge" class="app-card card-purple">
-      <div class="card-num">03</div>
+    <a href="/ct/" class="app-card card-gray" style="--delay:.15s">
+      <div class="card-icon-wrap">
+        <div class="card-icon">⏱</div>
+        <span class="card-arrow">&#8594;</span>
+      </div>
+      <div class="card-title">Cycle Time Report</div>
+      <div class="card-desc">Upload CT and Online Data files to generate the 7-sheet Excel workbook, Hourly Track summary, and PowerPoint with anomaly detection.</div>
+      <span class="card-badge badge-active">&#10003; Active</span>
+    </a>
+
+    <a href="/app/photo-merge" class="app-card card-purple" style="--delay:.20s">
       <div class="card-icon-wrap">
         <div class="card-icon">&#128444;</div>
         <span class="card-arrow">&#8594;</span>
@@ -2409,61 +3007,269 @@ h4 { font-size: 17px !important; }
       <span class="card-badge badge-active">&#10003; Active</span>
     </a>
 
-    <a href="/app/ppt-rejection" class="app-card card-amber">
-      <div class="card-num">04</div>
+    <a href="/app/ppt-rejection" class="app-card card-amber" style="--delay:.25s">
       <div class="card-icon-wrap">
         <div class="card-icon">&#128193;</div>
         <span class="card-arrow">&#8594;</span>
       </div>
-      <div class="card-title">Bulk Bundle Report Filter</div>
+      <div class="card-title">Pulp Bundle Report Filter</div>
       <div class="card-desc">Upload bulk PPT files, filter by E-Token/date/reason, and generate grouped rejection reports with ZIP export.</div>
       <span class="card-badge badge-active">&#10003; Active</span>
     </a>
-
-    <div class="app-card card-gray disabled">
-      <div class="card-num">05</div>
-      <div class="card-icon-wrap">
-        <div class="card-icon">&#8987;</div>
-        <span class="card-arrow">&#8594;</span>
-      </div>
-      <div class="card-title">Cycle Time Report</div>
-      <div class="card-desc">Cycle time analysis and reporting &mdash; in development. Coming soon.</div>
-      <span class="card-badge badge-soon">&#8987; In Progress</span>
-    </div>
 
   </div>
 
   <!-- Footer -->
   <div class="page-footer">
-    <div class="dev-credit">
-      <div class="karthi-avatar">&#129489;</div>
+    <div class="dev-credit" onclick="showMotivation()" title="Click for a message">
+      <span style="font-size:1.1rem;line-height:1;">&#129489;</span>
       Developed by&nbsp;<strong>Karthi</strong>
-      <div class="tooltip">
-        Hi &#128075; I built this tool to make your reporting faster and smarter.
-        <div class="tooltip-quote">&ldquo;Data tells the truth &mdash; if you listen properly.&rdquo;</div>
-      </div>
+      <span style="font-size:.7rem;color:rgba(99,102,241,.7);margin-left:4px;">✦</span>
     </div>
-    <div class="footer-meta">APSG (Staging Ground) Report &middot; v1.0 &middot; Internal Use Only</div>
+    <div class="footer-meta">APSG (Staging Ground) Report &middot; v2.0 &middot; Internal Use Only</div>
   </div>
 
 </div><!-- /page -->
+
+<!-- Change Password Modal -->
+<div id="profileModal" style="display:none;position:fixed;inset:0;z-index:9997;
+  align-items:center;justify-content:center;background:rgba(2,5,18,.65);backdrop-filter:blur(6px);">
+  <div style="max-width:360px;width:90%;background:rgba(10,16,42,.96);
+    border:1px solid rgba(99,102,241,.35);border-radius:18px;padding:1.8rem 2rem;
+    box-shadow:0 24px 80px rgba(0,0,0,.6);">
+    <div style="font-size:.95rem;font-weight:700;margin-bottom:1.2rem;text-align:center;">🔑 Change Password</div>
+    <div id="profileErr" style="display:none;font-size:.78rem;color:#F87171;background:rgba(248,113,113,.08);
+      border:1px solid rgba(248,113,113,.2);border-radius:8px;padding:.5rem .75rem;margin-bottom:.8rem;"></div>
+    <div id="profileOk" style="display:none;font-size:.78rem;color:#4ADE80;background:rgba(74,222,128,.08);
+      border:1px solid rgba(74,222,128,.2);border-radius:8px;padding:.5rem .75rem;margin-bottom:.8rem;"></div>
+    <div style="margin-bottom:.75rem;">
+      <label style="font-size:.67rem;font-weight:700;color:rgba(148,163,184,.7);letter-spacing:.1em;text-transform:uppercase;display:block;margin-bottom:.35rem;">Current Password</label>
+      <input type="password" id="proCurPw" style="width:100%;padding:.65rem .9rem;background:rgba(5,9,28,.8);border:1.5px solid rgba(99,102,241,.35);border-radius:10px;color:#EEF3FF;font-size:14px;">
+    </div>
+    <div style="margin-bottom:.75rem;">
+      <label style="font-size:.67rem;font-weight:700;color:rgba(148,163,184,.7);letter-spacing:.1em;text-transform:uppercase;display:block;margin-bottom:.35rem;">New Password</label>
+      <input type="password" id="proNewPw" style="width:100%;padding:.65rem .9rem;background:rgba(5,9,28,.8);border:1.5px solid rgba(99,102,241,.35);border-radius:10px;color:#EEF3FF;font-size:14px;">
+    </div>
+    <div style="margin-bottom:1.2rem;">
+      <label style="font-size:.67rem;font-weight:700;color:rgba(148,163,184,.7);letter-spacing:.1em;text-transform:uppercase;display:block;margin-bottom:.35rem;">Confirm New Password</label>
+      <input type="password" id="proConPw" style="width:100%;padding:.65rem .9rem;background:rgba(5,9,28,.8);border:1.5px solid rgba(99,102,241,.35);border-radius:10px;color:#EEF3FF;font-size:14px;">
+    </div>
+    <div style="display:flex;gap:.6rem;">
+      <button onclick="submitProfilePw()" style="flex:1;padding:.75rem;border-radius:10px;border:none;
+        background:linear-gradient(135deg,#4338CA,#6366F1);color:#fff;font-size:.88rem;font-weight:700;cursor:pointer;">
+        Update Password
+      </button>
+      <button onclick="document.getElementById('profileModal').style.display='none'" style="padding:.75rem 1rem;border-radius:10px;
+        border:1px solid rgba(148,163,184,.2);background:rgba(255,255,255,.04);
+        color:rgba(148,163,184,.7);font-size:.88rem;cursor:pointer;">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+function showProfileModal(){
+  document.getElementById('profileErr').style.display='none';
+  document.getElementById('profileOk').style.display='none';
+  document.getElementById('proCurPw').value='';
+  document.getElementById('proNewPw').value='';
+  document.getElementById('proConPw').value='';
+  document.getElementById('profileModal').style.display='flex';
+  setTimeout(()=>document.getElementById('proCurPw').focus(),80);
+}
+async function submitProfilePw(){
+  const err=document.getElementById('profileErr');
+  const ok=document.getElementById('profileOk');
+  err.style.display='none'; ok.style.display='none';
+  const cur=document.getElementById('proCurPw').value;
+  const nw=document.getElementById('proNewPw').value;
+  const con=document.getElementById('proConPw').value;
+  if(!cur||!nw||!con){err.textContent='All fields required.';err.style.display='block';return;}
+  try{
+    const r=await fetch('/api/user/change_password',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({current_password:cur,new_password:nw,confirm:con})});
+    const d=await r.json();
+    if(d.ok){ok.textContent='✅ Password updated successfully.';ok.style.display='block';
+      setTimeout(()=>document.getElementById('profileModal').style.display='none',1800);}
+    else{err.textContent=d.error||'Failed.';err.style.display='block';}
+  }catch(e){err.textContent='Connection error.';err.style.display='block';}
+}
+document.getElementById('profileModal').addEventListener('click',function(e){
+  if(e.target===this) this.style.display='none';
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape') document.getElementById('profileModal').style.display='none';
+});
+</script>
+<div id="motivPopup" style="
+  display:none;position:fixed;inset:0;z-index:9998;align-items:center;justify-content:center;
+  background:rgba(2,5,18,.65);backdrop-filter:blur(6px);transition:opacity .22s;">
+  <div id="motivInner" style="
+    max-width:390px;width:92%;background:rgba(10,16,42,.96);
+    border:1px solid rgba(99,102,241,.35);border-radius:20px;
+    padding:2rem 2.2rem;text-align:center;position:relative;
+    box-shadow:0 24px 80px rgba(0,0,0,.6),0 0 0 1px rgba(99,102,241,.15);
+    transition:transform .22s,opacity .22s;">
+    <button id="motivCloseBtn" style="
+      position:absolute;top:.8rem;right:1rem;background:none;border:none;
+      color:rgba(148,163,184,.7);font-size:1.3rem;cursor:pointer;line-height:1;
+      width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+      border-radius:50%;transition:all .15s;">✕</button>
+    <div style="font-size:2.2rem;margin-bottom:.6rem;">&#129489;</div>
+    <div id="motivSource" style="font-size:.72rem;font-weight:700;letter-spacing:.1em;
+      text-transform:uppercase;color:rgba(99,102,241,.85);margin-bottom:.75rem;min-height:1.1rem;"></div>
+    <div id="motivQuote" style="font-size:.95rem;font-weight:600;color:#EEF3FF;
+      line-height:1.68;margin-bottom:.5rem;min-height:3.2rem;"></div>
+    <div style="font-size:.67rem;color:rgba(148,163,184,.4);margin-top:.55rem;">
+      — Karthi &nbsp;&#10024; &nbsp;&middot;&nbsp; Click Next for another interesting thing
+    </div>
+    <div style="margin-top:1.4rem;display:flex;gap:.6rem;justify-content:center;">
+      <button id="motivNextBtn" style="
+        padding:.5rem 1.2rem;border-radius:8px;border:1px solid rgba(99,102,241,.4);
+        background:rgba(99,102,241,.12);color:#818CF8;font-size:.78rem;font-weight:600;
+        cursor:pointer;transition:all .2s;">Next &#8594;</button>
+      <button id="motivCloseBtn2" style="
+        padding:.5rem 1.2rem;border-radius:8px;border:1px solid rgba(148,163,184,.18);
+        background:rgba(255,255,255,.04);color:rgba(148,163,184,.7);font-size:.78rem;font-weight:600;
+        cursor:pointer;transition:all .2s;">Close</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const role="{{ role }}";
 if(role==="admin") document.getElementById("adminBtn").style.display="inline-flex";
 
+// ── Card entrance animation ────────────────────────────────────────────────────
+document.querySelectorAll('.app-card').forEach(card => {
+  const delay = card.style.getPropertyValue('--delay') || '0s';
+  card.style.opacity = '0';
+  card.style.transform = 'translateY(28px)';
+  card.style.transition = `opacity .5s ease ${delay}, transform .5s ease ${delay}`;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    card.style.opacity = '1';
+    card.style.transform = 'translateY(0)';
+  }));
+});
+
+// ── Wake screen ────────────────────────────────────────────────────────────────
 window.addEventListener("load", () => {
   const ws = document.getElementById("wakeScreen");
   const wm = document.getElementById("wakeMsg");
   fetch("/api/health").then(r => {
     wm.textContent = r.ok ? "Ready!" : "Server warming up...";
     setTimeout(() => {
-      ws.style.opacity = "0";
-      ws.style.transition = "opacity .5s";
+      ws.style.opacity = "0"; ws.style.transition = "opacity .5s";
       setTimeout(() => ws.style.display = "none", 520);
     }, r.ok ? 300 : 1800);
   }).catch(() => setTimeout(() => ws.style.display = "none", 1500));
 });
+
+// ── Motivational popup — fixed close + dynamic interesting things ─────────────
+const _cards = [
+  {cat:"💡 Productivity Tip",  text:"The 2-minute rule: if a task takes less than 2 minutes, do it now."},
+  {cat:"🔧 Tech Fact",         text:"Excel's maximum row count — 1,048,576 — is exactly 2 to the power of 20."},
+  {cat:"📜 Did You Know",      text:"The Post-it Note was invented accidentally in 1968 when the adhesive came out too weak."},
+  {cat:"✨ Insight",           text:"You don't rise to the level of your goals — you fall to the level of your systems."},
+  {cat:"📊 Work & Data",       text:"Bad data costs businesses an average of $12.9M per year. Clean data is the foundation."},
+  {cat:"🌿 Nature Fact",       text:"Ants have been farming fungi for over 50 million years — long before humans discovered agriculture."},
+  {cat:"💡 Productivity Tip",  text:"Writing down 3 priorities the night before reduces morning decision fatigue by 40%."},
+  {cat:"🔧 Tech Fact",         text:"Python was named after Monty Python's Flying Circus — not the snake."},
+  {cat:"✨ Insight",           text:"Most overnight successes took 10 years. The work was invisible; only the result was sudden."},
+  {cat:"📊 Work & Data",       text:"A report that saves 1 hour per week pays back 2 hours of build time in just 2 weeks."},
+];
+let _qi = 0, _motivOpen = false;
+
+function _motivClose() {
+  if (!_motivOpen) return;
+  _motivOpen = false;
+  const p   = document.getElementById('motivPopup');
+  const inn = document.getElementById('motivInner');
+  // Set transition FIRST, THEN change values
+  p.style.transition   = 'opacity .22s';
+  inn.style.transition = 'opacity .22s, transform .22s';
+  p.style.opacity      = '0';
+  inn.style.opacity    = '0';
+  inn.style.transform  = 'scale(.92)';
+  document.body.style.overflow = '';
+  setTimeout(() => {
+    p.style.display    = 'none';
+    p.style.opacity    = '';
+    inn.style.opacity  = '';
+    inn.style.transform = '';
+  }, 230);
+}
+
+async function showMotivation() {
+  if (_motivOpen) return;
+  const p   = document.getElementById('motivPopup');
+  const inn = document.getElementById('motivInner');
+  if (!p || !inn) return;
+
+  // Show a local card immediately — no blank flash
+  _qi = Math.floor(Math.random() * _cards.length);
+  _setCard(_cards[_qi].cat, _cards[_qi].text);
+
+  // Fetch a fresh interesting thing from server (non-blocking)
+  fetch('/api/quote').then(r => r.ok ? r.json() : null).then(d => {
+    if (d && d.quote) _setCard(d.category || '', d.quote);
+  }).catch(() => {});
+
+  // Animate open
+  _motivOpen = true;
+  document.body.style.overflow = 'hidden';
+  p.style.display      = 'flex';
+  p.style.opacity      = '0';
+  inn.style.opacity    = '0';
+  inn.style.transform  = 'scale(.9) translateY(12px)';
+  p.style.transition   = 'none';
+  inn.style.transition = 'none';
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    p.style.transition   = 'opacity .25s';
+    inn.style.transition = 'opacity .25s, transform .28s cubic-bezier(.34,1.56,.64,1)';
+    p.style.opacity      = '1';
+    inn.style.opacity    = '1';
+    inn.style.transform  = 'scale(1) translateY(0)';
+  }));
+}
+
+function _setCard(cat, text) {
+  const el  = document.getElementById('motivQuote');
+  const src = document.getElementById('motivSource');
+  if (el)  el.textContent  = text;
+  if (src) src.textContent = cat || '';
+}
+
+function nextQuote() {
+  const el  = document.getElementById('motivQuote');
+  const src = document.getElementById('motivSource');
+  if (!el) return;
+  el.style.transition = 'opacity .18s'; el.style.opacity = '0';
+  if (src) { src.style.transition = 'opacity .18s'; src.style.opacity = '0'; }
+  setTimeout(() => {
+    fetch('/api/quote').then(r => r.ok ? r.json() : null).then(d => {
+      if (d && d.quote) _setCard(d.category||'', d.quote);
+      else { _qi=(_qi+1)%_cards.length; _setCard(_cards[_qi].cat, _cards[_qi].text); }
+      el.style.opacity='1'; if(src) src.style.opacity='1';
+    }).catch(() => {
+      _qi=(_qi+1)%_cards.length; _setCard(_cards[_qi].cat, _cards[_qi].text);
+      el.style.opacity='1'; if(src) src.style.opacity='1';
+    });
+  }, 160);
+}
+
+// Wire up close buttons and events
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('motivCloseBtn').addEventListener('click',  _motivClose);
+  document.getElementById('motivCloseBtn2').addEventListener('click', _motivClose);
+  document.getElementById('motivNextBtn').addEventListener('click',   nextQuote);
+  // Click outside (on the overlay backdrop) closes it
+  document.getElementById('motivPopup').addEventListener('click', e => {
+    if (e.target === document.getElementById('motivPopup')) _motivClose();
+  });
+});
+// ESC key
+document.addEventListener('keydown', e => { if (e.key === 'Escape') _motivClose(); });
 </script>
 <div class="apsg-footer">✦ Internal Reporting Platform — APSG Staging Ground &nbsp;·&nbsp; Developed by Karthik</div>
 </body>
@@ -5495,7 +6301,7 @@ h4 { font-size: 17px !important; }
             <div class="sec-hint">Drag & drop or click — .xlsx, .xls, .csv accepted</div>
           </div>
           <div class="upload-zone" onclick="document.getElementById('onlineFile').click()">
-            <input type="file" id="onlineFile" accept=".xlsx,.xls,.csv" onchange="onOnlineFileChange()">
+            <input type="file" id="onlineFile" accept=".xlsx,.xls,.csv" onchange="onOnlineFileChange()" onclick="event.stopPropagation()">
             <div style="font-size:2rem;margin-bottom:.4rem">📂</div>
             <strong style="font-size:.9rem">Drop or click to upload Online export</strong>
             <p style="font-size:.76rem;color:#2D3F60;margin-top:.3rem">.xlsx · .xls · .csv</p>
@@ -5535,7 +6341,7 @@ h4 { font-size: 17px !important; }
             <div class="sec-hint">.xlsx / .xls / .csv — Weighbridge server export</div>
           </div>
           <div class="upload-zone upload-zone-wb" onclick="document.getElementById('wbFile').click()">
-            <input type="file" id="wbFile" accept=".xlsx,.xls,.csv" onchange="onWbFileChange()">
+            <input type="file" id="wbFile" accept=".xlsx,.xls,.csv" onchange="onWbFileChange()" onclick="event.stopPropagation()">
             <div style="font-size:2rem;margin-bottom:.4rem">⚖️</div>
             <strong style="font-size:.9rem">Drop or click to upload WB file</strong>
             <p style="font-size:.76rem;color:#2D3F60;margin-top:.3rem">.xlsx · .xls · .csv</p>
@@ -6049,14 +6855,24 @@ function renderComparisonTable(){
 
 function renderPivot(rows){
   if(!rows||!rows.length){clearEl('pivotSection');return;}
-  let html=`<div class="pivot-outer"><div class="pivot-title">📊 WB Pivot — Net Weight by Material & Site</div><table class="pivot-tbl"><thead><tr>`;
-  const cols=Object.keys(rows[0]);
-  cols.forEach(c=>{html+=`<th>${esc(c)}</th>`;});
+  let html=`<div class="pivot-outer"><div class="pivot-title">📊 WB Pivot — Net Weight by Material &amp; Site</div><table class="pivot-tbl"><thead><tr>`;
+  html+=`<th>LABEL</th><th>LOADS</th><th>WEIGHT IN (T)</th><th>WEIGHT OUT (T)</th><th>NET WEIGHT (T)</th>`;
   html+=`</tr></thead><tbody>`;
   rows.forEach(r=>{
-    const cls=r['SITE CODE']==='GRAND TOTAL'?'pivot-grand':r['SITE CODE']===''?'pivot-mat':'';
+    const isMat  = r['type']==='mat_header';
+    const isGrand= r['label']==='GRAND TOTAL';
+    const cls    = isGrand ? 'pivot-grand' : isMat ? 'pivot-mat' : '';
     html+=`<tr class="${cls}">`;
-    cols.forEach(c=>{html+=`<td>${esc(String(r[c]??''))}</td>`;});
+    if(isMat){
+      // Material header row: span all data columns, show only label
+      html+=`<td colspan="5" style="text-align:left;font-weight:800;letter-spacing:.04em;">${esc(r['label'])}</td>`;
+    } else {
+      html+=`<td>${esc(r['label'])}</td>`;
+      html+=`<td>${r['loads']||0}</td>`;
+      html+=`<td>${(+(r['wi']||0)).toFixed(2)}</td>`;
+      html+=`<td>${(+(r['wo']||0)).toFixed(2)}</td>`;
+      html+=`<td>${(+(r['nw']||0)).toFixed(2)}</td>`;
+    }
     html+=`</tr>`;
   });
   html+=`</tbody></table></div>`;
@@ -6757,8 +7573,8 @@ h4 { font-size: 17px !important; }
       </div>
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>#</th><th>Username</th><th>Password</th><th>Full Name</th><th>Role</th><th>Registered</th><th>Actions</th></tr></thead>
-          <tbody id="usersTbl"><tr><td colspan="5" class="no-data"><span class="spinner">⟳</span></td></tr></tbody>
+          <thead><tr><th>#</th><th>Username</th><th>Password</th><th>Full Name</th><th>Email</th><th>Verified</th><th>Role</th><th>Registered</th><th>Actions</th></tr></thead>
+          <tbody id="usersTbl"><tr><td colspan="9" class="no-data"><span class="spinner">⟳</span></td></tr></tbody>
         </table>
       </div>
     </div>
@@ -6866,37 +7682,152 @@ async function loadAnalytics(){
 
 async function loadUsers(){
   const tb=document.getElementById('usersTbl');
-  tb.innerHTML='<tr><td colspan="6" class="no-data"><span class="spinner">⟳</span></td></tr>';
+  tb.innerHTML='<tr><td colspan="9" class="no-data"><span class="spinner">⟳</span></td></tr>';
   try{
     const res=await fetch('/api/admin/users');const d=await res.json();
-    tb.innerHTML=d.length?d.map((u,i)=>`<tr>
-      <td style="color:#475569;font-size:.72rem">${i+1}</td>
-      <td><strong>${esc(u.username)}</strong></td>
-      <td>
-        <span style="display:flex;align-items:center;gap:.4rem;">
-          <span id="pw-${esc(u.username)}" style="font-family:monospace;font-size:.8rem;color:#C8D8F8;letter-spacing:.08em;">••••••••</span>
-          <button onclick="togglePwView('${esc(u.username)}')" title="Show/Hide password"
-            style="background:none;border:none;cursor:pointer;font-size:.85rem;padding:.1rem .2rem;color:#818CF8;">
-            <span id="pw-eye-${esc(u.username)}">👁</span>
-          </button>
-        </span>
-      </td>
-      <td>${esc(u.name)}</td>
-      <td><span class="${u.role==='admin'?'role-admin':'role-user'}">${u.role}</span></td>
-      <td style="font-size:.7rem;color:#475569">${(u.created_at||'—').slice(0,16)}</td>
-      <td>
-        <div style="display:flex;gap:.35rem;flex-wrap:wrap">
-          <button class="btn-action btn-pw" onclick="openChangePw('${esc(u.username)}','${esc(u.name)}')" title="Change Password">🔑 Change PW</button>
-          <button class="btn-action btn-reset" onclick="resetPw('${esc(u.username)}')" title="Generate temporary password">🎲 Reset PW</button>
-          ${u.username!=='admin'?`<button class="btn-action btn-del" onclick="deleteUser('${esc(u.username)}','${esc(u.name)}')" title="Delete user">🗑 Delete</button>`:''}
-        </div>
-      </td>
-    </tr>`).join(''):'<tr><td colspan="6" class="no-data">No users found</td></tr>';
-  }catch(e){tb.innerHTML=`<tr><td colspan="6" class="no-data">Error: ${e.message}</td></tr>`;}
+    tb.innerHTML=d.length?d.map((u,i)=>{
+      const verified = u.email_verified
+        ? '<span style="color:#10B981;font-weight:700;font-size:.78rem;">✓ Verified</span>'
+        : '<span style="color:#F59E0B;font-weight:600;font-size:.78rem;">⏳ Unverified</span>';
+      const isAdmin = u.role==='admin';
+      return `<tr>
+        <td style="color:#475569;font-size:.72rem">${i+1}</td>
+        <td><strong>${esc(u.username)}</strong></td>
+        <td>
+          <span style="display:flex;align-items:center;gap:.4rem;">
+            <span id="pw-${esc(u.username)}" style="font-family:monospace;font-size:.8rem;color:#C8D8F8;letter-spacing:.08em;">••••••••</span>
+            <button onclick="togglePwView('${esc(u.username)}')" title="Show/Hide"
+              style="background:none;border:none;cursor:pointer;font-size:.85rem;padding:.1rem .2rem;color:#818CF8;">
+              <span id="pw-eye-${esc(u.username)}">👁</span>
+            </button>
+          </span>
+        </td>
+        <td>${esc(u.name)}</td>
+        <td style="font-size:.78rem;color:#A5B4FC">${esc(u.email||'—')}</td>
+        <td>${verified}</td>
+        <td><span class="${isAdmin?'role-admin':'role-user'}">${u.role}</span></td>
+        <td style="font-size:.7rem;color:#475569">${(u.created_at||'—').slice(0,16)}</td>
+        <td>
+          <div style="display:flex;gap:.35rem;flex-wrap:wrap">
+            <button class="btn-action" style="background:rgba(99,102,241,.15);color:#818CF8;border-color:rgba(99,102,241,.3);"
+              onclick="openMasterResetPw('${esc(u.username)}','${esc(u.name)}')" title="Reset Password">
+              🔑 Reset PW
+            </button>
+            ${!isAdmin?`<button class="btn-action btn-del"
+              onclick="confirmDeleteUser('${esc(u.username)}','${esc(u.name)}')" title="Delete user">
+              🗑 Delete
+            </button>`:'<span style="font-size:.7rem;color:#475569;">Protected</span>'}
+          </div>
+        </td>
+      </tr>`;
+    }).join(''):'<tr><td colspan="9" class="no-data">No users found</td></tr>';
+  }catch(e){tb.innerHTML=`<tr><td colspan="9" class="no-data">Error: ${e.message}</td></tr>`;}
 }
 
-// ── Change Password Modal ──────────────────────────────────────────────────────
-const _pwCache={};  // username → plaintext (session cache)
+// ── Master Password Reset ─────────────────────────────────────────────────────
+let _masterResetUsername = '';
+let _masterToken = '';
+
+function openMasterResetPw(username, name) {
+  _masterResetUsername = username;
+  _masterToken = '';
+  document.getElementById('masterResetUser').textContent  = `${name} (@${username})`;
+  document.getElementById('masterResetUser2').textContent = `${name} (@${username})`;
+  document.getElementById('masterPwInput').value  = '';
+  document.getElementById('newPwInput').value     = '';
+  document.getElementById('newPwConfirm').value   = '';
+  document.getElementById('masterStep1Result').innerHTML = '';
+  document.getElementById('masterStep2Result').innerHTML = '';
+  document.getElementById('masterStep1').style.display = 'block';
+  document.getElementById('masterStep2').style.display = 'none';
+  document.getElementById('masterResetModal').style.display = 'flex';
+  setTimeout(() => document.getElementById('masterPwInput').focus(), 80);
+}
+function closeMasterReset() {
+  document.getElementById('masterResetModal').style.display = 'none';
+  _masterToken = '';
+}
+
+async function submitMasterVerify() {
+  const pw = document.getElementById('masterPwInput').value;
+  const res_el = document.getElementById('masterStep1Result');
+  res_el.innerHTML = '';
+  if (!pw) { res_el.innerHTML = '<span style="color:#F87171">Please enter your admin password.</span>'; return; }
+  try {
+    const r = await fetch('/api/admin/verify_master', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: pw})});
+    const d = await r.json();
+    if (d.ok) {
+      _masterToken = d.token;
+      document.getElementById('masterStep1').style.display = 'none';
+      document.getElementById('masterStep2').style.display = 'block';
+      setTimeout(() => document.getElementById('newPwInput').focus(), 80);
+    } else {
+      res_el.innerHTML = `<span style="color:#F87171">❌ ${esc(d.error||'Incorrect password')}</span>`;
+    }
+  } catch(e) { res_el.innerHTML = `<span style="color:#F87171">Connection error</span>`; }
+}
+
+async function submitNewPassword() {
+  const newPw   = document.getElementById('newPwInput').value.trim();
+  const confirm = document.getElementById('newPwConfirm').value.trim();
+  const res_el  = document.getElementById('masterStep2Result');
+  res_el.innerHTML = '';
+  if (!newPw || newPw.length < 6) { res_el.innerHTML = '<span style="color:#F87171">Password must be at least 6 characters.</span>'; return; }
+  if (newPw !== confirm) { res_el.innerHTML = '<span style="color:#F87171">Passwords do not match.</span>'; return; }
+  try {
+    const r = await fetch(`/api/admin/user/${encodeURIComponent(_masterResetUsername)}/reset_password`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({master_token: _masterToken, new_password: newPw, confirm})});
+    const d = await r.json();
+    if (d.ok) {
+      res_el.innerHTML = `<span style="color:#4ADE80">✅ Password reset for @${esc(_masterResetUsername)}</span>`;
+      setTimeout(closeMasterReset, 1800);
+    } else {
+      res_el.innerHTML = `<span style="color:#F87171">❌ ${esc(d.error||'Failed')}</span>`;
+    }
+  } catch(e) { res_el.innerHTML = `<span style="color:#F87171">Connection error</span>`; }
+}
+
+// ── Delete User ───────────────────────────────────────────────────────────────
+let _deleteUsername = '';
+
+function confirmDeleteUser(username, name) {
+  _deleteUsername = username;
+  document.getElementById('deleteModalUser').textContent = `${name} (@${username})`;
+  document.getElementById('deleteModalResult').innerHTML = '';
+  document.getElementById('confirmDeleteBtn').disabled = false;
+  document.getElementById('deleteModal').style.display = 'flex';
+}
+function closeDeleteModal() {
+  document.getElementById('deleteModal').style.display = 'none';
+  _deleteUsername = '';
+}
+
+async function executeDelete() {
+  if (!_deleteUsername) return;
+  const btn = document.getElementById('confirmDeleteBtn');
+  btn.disabled = true; btn.textContent = '⏳ Deleting…';
+  try {
+    const r = await fetch(`/api/admin/user/${encodeURIComponent(_deleteUsername)}/delete`, {method:'DELETE'});
+    const ct = r.headers.get('Content-Type')||'';
+    if (!ct.includes('application/json')) {
+      document.getElementById('deleteModalResult').innerHTML = '<span style="color:#F87171">Session expired. Please reload.</span>';
+      btn.disabled=false;btn.textContent='🗑 Yes, Delete Account';return;
+    }
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('deleteModalResult').innerHTML = `<span style="color:#4ADE80">✅ Account deleted.</span>`;
+      setTimeout(() => { closeDeleteModal(); loadUsers(); }, 1200);
+    } else {
+      document.getElementById('deleteModalResult').innerHTML = `<span style="color:#F87171">❌ ${esc(d.error||'Failed')}</span>`;
+      btn.disabled=false;btn.textContent='🗑 Yes, Delete Account';
+    }
+  } catch(e) {
+    document.getElementById('deleteModalResult').innerHTML = `<span style="color:#F87171">Connection error</span>`;
+    btn.disabled=false;btn.textContent='🗑 Yes, Delete Account';
+  }
+}
 
 async function togglePwView(username){
   const el=document.getElementById(`pw-${username}`);
@@ -6916,6 +7847,8 @@ async function togglePwView(username){
   el.textContent='⏳';
   try{
     const res=await fetch(`/api/admin/user/${encodeURIComponent(username)}/view_password`);
+    const ct=res.headers.get('Content-Type')||'';
+    if(!ct.includes('application/json')){el.textContent='Login required';return;}
     const d=await res.json();
     if(d.ok){
       _pwCache[username]=d.password;
@@ -6947,17 +7880,23 @@ async function submitChangePw(){
   const username=document.getElementById('pwModalUsername').value;
   const newPw=document.getElementById('pwModalNewPw').value.trim();
   const confirm=document.getElementById('pwModalConfirm').value.trim();
-  const resultEl=document.getElementById('pwModalResult');
   if(!newPw||newPw.length<6){showModalResult('Password must be at least 6 characters.','error');return;}
   if(newPw!==confirm){showModalResult('Passwords do not match.','error');return;}
   try{
     const res=await fetch(`/api/admin/user/${encodeURIComponent(username)}/password`,{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({password:newPw})});
+    // Check content-type before parsing — server may return HTML on session expiry
+    const ct=res.headers.get('Content-Type')||'';
+    if(!ct.includes('application/json')){
+      showModalResult('Session expired. Please <a href="/login" style="color:#818CF8">log in again</a>.','error');
+      return;
+    }
     const d=await res.json();
-    if(d.ok){showModalResult(`✅ Password updated successfully for @${username}`,'ok');setTimeout(closePwModal,1800);}
-    else{showModalResult(d.error||'Failed','error');}
-  }catch(e){showModalResult(e.message,'error');}
+    if(d.ok){showModalResult(`✅ Password updated for @${username}`,'ok');setTimeout(closePwModal,1800);}
+    else if(d.redirect){showModalResult('Session expired. <a href="/login" style="color:#818CF8">Log in again</a>.','error');}
+    else{showModalResult(d.error||'Failed to update password.','error');}
+  }catch(e){showModalResult('Connection error: '+e.message,'error');}
 }
 
 // ── Reset Password (generates temp password) ──────────────────────────────────
@@ -7027,48 +7966,73 @@ function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').
 loadAnalytics();
 </script>
 
-<!-- ── Change Password Modal ── -->
-<div class="modal-overlay" id="pwModal" onclick="if(event.target===this)closePwModal()">
-  <div class="modal-card">
-    <div class="modal-title">🔑 Change Password</div>
-    <div class="modal-sub" id="pwModalUser"></div>
-    <input type="hidden" id="pwModalUsername">
-    <div class="modal-field">
-      <label>New Password</label>
-      <input type="password" id="pwModalNewPw" placeholder="Enter new password (min 6 chars)">
+<!-- ── Master Password Reset Modal (2-step: verify admin pw → set new pw) ── -->
+<div class="modal-overlay" id="masterResetModal" onclick="if(event.target===this)closeMasterReset()">
+  <div class="modal-card" style="max-width:400px">
+
+    <!-- Step 1: Verify master password -->
+    <div id="masterStep1">
+      <div class="modal-title">🛡 Admin Authentication</div>
+      <div class="modal-sub" id="masterResetUser"></div>
+      <div style="font-size:.78rem;color:#94A3B8;margin-bottom:1rem;line-height:1.5;
+        background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.2);
+        border-radius:8px;padding:.6rem .85rem;">
+        ⚠️ Enter your <strong style="color:#F59E0B">admin password</strong> to authorise this password reset.
+      </div>
+      <div class="modal-field">
+        <label>Your Admin Password</label>
+        <input type="password" id="masterPwInput" placeholder="Enter your admin password">
+      </div>
+      <div class="modal-result" id="masterStep1Result"></div>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-cancel" onclick="closeMasterReset()">✕ Cancel</button>
+        <button class="modal-btn modal-btn-primary" onclick="submitMasterVerify()">🔓 Authenticate →</button>
+      </div>
     </div>
-    <div class="modal-field">
-      <label>Confirm Password</label>
-      <input type="password" id="pwModalConfirm" placeholder="Re-enter new password">
+
+    <!-- Step 2: Set new password (shown after auth) -->
+    <div id="masterStep2" style="display:none">
+      <div class="modal-title">🔑 Reset Password</div>
+      <div class="modal-sub" id="masterResetUser2"></div>
+      <div style="font-size:.75rem;color:#34D399;margin-bottom:1rem;
+        background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.2);
+        border-radius:8px;padding:.5rem .85rem;">✅ Admin authenticated — set new password below</div>
+      <div class="modal-field">
+        <label>New Password</label>
+        <input type="password" id="newPwInput" placeholder="Minimum 6 characters">
+      </div>
+      <div class="modal-field">
+        <label>Confirm New Password</label>
+        <input type="password" id="newPwConfirm" placeholder="Re-enter new password">
+      </div>
+      <div class="modal-result" id="masterStep2Result"></div>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-cancel" onclick="closeMasterReset()">✕ Cancel</button>
+        <button class="modal-btn modal-btn-primary" onclick="submitNewPassword()">✔ Save Password</button>
+      </div>
     </div>
-    <label class="show-pw-row">
-      <input type="checkbox" id="pwShowToggle" onchange="togglePwShow(this.checked)">
-      Show passwords
-    </label>
-    <div class="modal-result" id="pwModalResult"></div>
-    <div class="modal-actions">
-      <button class="modal-btn modal-btn-cancel" onclick="closePwModal()">✕ Cancel</button>
-      <button class="modal-btn modal-btn-primary" onclick="submitChangePw()">✔ Update Password</button>
-    </div>
+
   </div>
 </div>
 
-<!-- ── Temp Password Display Modal ── -->
-<div class="modal-overlay" id="tempPwModal" onclick="if(event.target===this)closeTempPwModal()">
-  <div class="modal-card">
-    <div class="modal-title">🎲 Temporary Password Generated</div>
-    <div class="modal-sub" id="tempPwUser"></div>
-    <div class="temp-pw-box">
-      <div class="temp-pw-label">Temporary Password</div>
-      <div class="temp-pw-value" id="tempPwValue"></div>
+<!-- ── Delete Confirmation Modal ── -->
+<div class="modal-overlay" id="deleteModal" onclick="if(event.target===this)closeDeleteModal()">
+  <div class="modal-card" style="max-width:380px;text-align:center">
+    <div style="font-size:2.5rem;margin-bottom:.5rem;">🗑</div>
+    <div class="modal-title" style="color:#F87171">Delete User Account</div>
+    <div class="modal-sub" id="deleteModalUser"></div>
+    <div style="font-size:.82rem;color:#94A3B8;margin:1rem 0;line-height:1.55;
+      background:rgba(248,113,113,.06);border:1px solid rgba(248,113,113,.18);
+      border-radius:8px;padding:.7rem .9rem;">
+      ⚠️ This will <strong style="color:#F87171">permanently delete</strong> this account and all associated data.
+      This action <strong>cannot be undone</strong>.
     </div>
-    <div class="temp-pw-warn">
-      ⚠️ Share this password securely with the user. It will be required to log in.
-      The user should change it immediately after logging in.
-    </div>
-    <div class="modal-actions" style="margin-top:1rem">
-      <button class="modal-btn modal-btn-cancel" onclick="closeTempPwModal()">✕ Close</button>
-      <button class="modal-btn modal-btn-primary" id="copyTempBtn" onclick="copyTempPw()">📋 Copy Password</button>
+    <div class="modal-result" id="deleteModalResult"></div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-cancel" onclick="closeDeleteModal()">✕ Cancel</button>
+      <button class="modal-btn" id="confirmDeleteBtn"
+        style="background:rgba(248,113,113,.15);color:#F87171;border-color:rgba(248,113,113,.4);"
+        onclick="executeDelete()">🗑 Yes, Delete Account</button>
     </div>
   </div>
 </div>
